@@ -25,7 +25,13 @@ from urllib3.exceptions import (
 from urllib3.util import is_fp_closed
 from urllib3.util.connection import _has_ipv6, allowed_gai_family, create_connection
 from urllib3.util.proxy import connection_requires_http_tunnel
-from urllib3.util.request import _FAILEDTELL, make_headers, rewind_body
+from urllib3.util.request import (
+    _FAILEDTELL,
+    _NON_REWINDABLE_ITERATOR,
+    make_headers,
+    rewind_body,
+    set_file_position,
+)
 from urllib3.util.response import assert_header_parsing
 from urllib3.util.ssl_ import (
     _is_has_never_check_common_name_reliable,
@@ -919,6 +925,33 @@ class TestUtil:
 
         with pytest.raises(UnrewindableBodyError):
             rewind_body(NoSeek(), body_pos=2)
+
+    def test_rewind_body_one_shot_iterator(self) -> None:
+        body = iter([b"chunk"])
+        with pytest.raises(UnrewindableBodyError):
+            rewind_body(body, body_pos=_NON_REWINDABLE_ITERATOR)
+
+    def test_set_file_position_one_shot_iterator_records_sentinel(self) -> None:
+        # A one-shot iterator gets a sentinel position so that the retry
+        # path fails loudly instead of resending an empty body.
+        def generator() -> typing.Iterator[bytes]:
+            yield b"chunk"
+
+        body = generator()
+        assert set_file_position(body, None) is _NON_REWINDABLE_ITERATOR
+        with pytest.raises(UnrewindableBodyError):
+            set_file_position(body, _NON_REWINDABLE_ITERATOR)
+
+        # iter() of a reusable iterable is equally one-shot.
+        assert set_file_position(iter([b"chunk"]), None) is _NON_REWINDABLE_ITERATOR
+
+    @pytest.mark.parametrize("body", [b"bytes body", [b"list", b"body"], ("t",)])
+    def test_set_file_position_replayable_bodies_keep_none(
+        self, body: typing.Any
+    ) -> None:
+        # Multi-pass bodies must keep the historical behavior: no position
+        # is recorded, leaving them fully replayable on retry.
+        assert set_file_position(body, None) is None
 
     def test_add_stderr_logger(self) -> None:
         handler = add_stderr_logger(level=logging.INFO)  # Don't actually print debug

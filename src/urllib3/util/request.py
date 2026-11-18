@@ -45,9 +45,16 @@ class _TYPE_FAILEDTELL(Enum):
     token = 0
 
 
-_FAILEDTELL: Final[_TYPE_FAILEDTELL] = _TYPE_FAILEDTELL.token
+class _TYPE_NON_REWINDABLE_ITERATOR(Enum):
+    token = 0
 
-_TYPE_BODY_POSITION = typing.Union[int, _TYPE_FAILEDTELL]
+
+_FAILEDTELL: Final[_TYPE_FAILEDTELL] = _TYPE_FAILEDTELL.token
+_NON_REWINDABLE_ITERATOR: Final[_TYPE_NON_REWINDABLE_ITERATOR] = (
+    _TYPE_NON_REWINDABLE_ITERATOR.token
+)
+
+_TYPE_BODY_POSITION = typing.Union[int, _TYPE_FAILEDTELL, _TYPE_NON_REWINDABLE_ITERATOR]
 
 # When sending a request with these methods we aren't expecting
 # a body so don't need to set an explicit 'Content-Length: 0'
@@ -173,6 +180,20 @@ def make_headers(
     return headers
 
 
+def _is_one_shot_iterator(body: typing.Any) -> bool:
+    """
+    Return whether ``body`` is a one-shot iterator, i.e. an object that
+    implements the iterator protocol and therefore can only be consumed
+    once. Rewinding such a body for a redirect/retry is impossible, so it
+    must not be silently resent as an empty payload.
+
+    Reusable iterables (``bytes``, ``list``, ``tuple`` and other
+    multi-pass iterables) do not expose ``__next__`` themselves and are
+    therefore left untouched, matching the ``body_to_chunks()`` contract.
+    """
+    return hasattr(body, "__next__")
+
+
 def set_file_position(
     body: typing.Any, pos: _TYPE_BODY_POSITION | None
 ) -> _TYPE_BODY_POSITION | None:
@@ -189,6 +210,14 @@ def set_file_position(
             # This differentiates from None, allowing us to catch
             # a failed `tell()` later when trying to rewind the body.
             pos = _FAILEDTELL
+    elif _is_one_shot_iterator(body):
+        # A one-shot iterator (e.g. a generator, or `iter(iterable)`) is
+        # exhausted by the first request and has no seek/tell support, so
+        # it cannot be replayed on a redirect/retry. Record a sentinel
+        # instead of leaving `pos` as None: with None the retry path would
+        # skip rewinding and silently resend an empty body while still
+        # reporting success to the caller.
+        pos = _NON_REWINDABLE_ITERATOR
 
     return pos
 
@@ -216,6 +245,11 @@ def rewind_body(body: typing.IO[typing.AnyStr], body_pos: _TYPE_BODY_POSITION) -
         raise UnrewindableBodyError(
             "Unable to record file position for rewinding "
             "request body during a redirect/retry."
+        )
+    elif body_pos is _NON_REWINDABLE_ITERATOR:
+        raise UnrewindableBodyError(
+            "Request body is a one-shot iterator that has already been "
+            "consumed and cannot be rewound for a redirect/retry."
         )
     elif body_seek is None:
         raise UnrewindableBodyError("body does not implement seek.")

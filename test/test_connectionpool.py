@@ -37,6 +37,7 @@ from urllib3.exceptions import (
     UnrewindableBodyError,
 )
 from urllib3.response import HTTPResponse
+from urllib3.util.request import body_to_chunks
 from urllib3.util.ssl_match_hostname import CertificateError
 from urllib3.util.timeout import _DEFAULT_TIMEOUT, Timeout
 
@@ -744,6 +745,169 @@ class TestConnectionPool:
                         retries=Retry(total=2, allowed_methods=["POST"]),
                         body_pos=None,
                     )
+
+    @pytest.mark.parametrize(
+        "body_factory",
+        [
+            # A generator is a one-shot iterator.
+            lambda: (chunk for chunk in [b"foo", b"bar", b"baz"]),
+            # iter() over a reusable iterable also yields a one-shot iterator.
+            lambda: iter([b"foo", b"bar", b"baz"]),
+        ],
+    )
+    def test_retry_with_one_shot_iterator_body_raises_unrewindable(
+        self, body_factory: typing.Callable[[], typing.Any]
+    ) -> None:
+        """
+        A one-shot iterator is exhausted by the first request and cannot be
+        replayed. On retry the pool must raise ``UnrewindableBodyError``
+        instead of silently resending an empty (already consumed) body while
+        reporting success to the caller.
+        """
+        body = body_factory()
+        attempts = 0
+
+        def fail_every_time(
+            conn: HTTPConnection,
+            method: str,
+            url: str,
+            *args: typing.Any,
+            **kwargs: typing.Any,
+        ) -> typing.NoReturn:
+            nonlocal attempts
+            attempts += 1
+            raise OSError("connection reset")
+
+        with HTTPConnectionPool(host="localhost", maxsize=1) as pool:
+            with patch.object(pool, "_make_request", side_effect=fail_every_time):
+                with pytest.raises(
+                    UnrewindableBodyError,
+                    match="one-shot iterator that has already been consumed",
+                ):
+                    pool.urlopen(
+                        "POST",
+                        "/",
+                        body=body,  # type: ignore[arg-type]
+                        retries=Retry(total=2, allowed_methods=["POST"]),
+                        chunked=True,
+                    )
+
+            # The body is rejected at the first rewind attempt, before any
+            # empty payload can reach the connection layer: only the initial
+            # (failed) request was ever attempted.
+            assert attempts == 1
+
+    @pytest.mark.parametrize(
+        "body, expected_chunks",
+        [
+            (b"foo bar baz", (b"foo bar baz",)),
+            ([b"foo", b"bar", b"baz"], (b"foo", b"bar", b"baz")),
+        ],
+    )
+    def test_retry_replays_bytes_and_list_bodies_in_full(
+        self, body: typing.Any, expected_chunks: tuple[bytes, ...]
+    ) -> None:
+        """
+        Bytes and list bodies remain replayable: after a failed first
+        attempt the retry must resend the complete original body rather than
+        an empty or truncated payload.
+        """
+        seen_bodies: list[typing.Any] = []
+
+        def flaky_make_request(
+            conn: HTTPConnection,
+            method: str,
+            url: str,
+            *args: typing.Any,
+            **kwargs: typing.Any,
+        ) -> Mock:
+            seen_bodies.append(kwargs["body"])
+            if len(seen_bodies) == 1:
+                raise OSError("connection reset")
+            response = Mock()
+            response.status = 200
+            response.get_redirect_location.return_value = None
+            response.headers = {}
+            response.retries = kwargs["retries"]
+            return response
+
+        with HTTPConnectionPool(host="localhost", maxsize=1) as pool:
+            with patch.object(pool, "_make_request", side_effect=flaky_make_request):
+                response = pool.urlopen(
+                    "POST",
+                    "/",
+                    body=body,
+                    retries=Retry(total=2, allowed_methods=["POST"]),
+                    chunked=True,
+                )
+
+        assert response.status == 200
+        assert len(seen_bodies) == 2
+
+        # The same body object is handed to both attempts and still yields
+        # the full payload on the replay.
+        first_chunks = tuple(body_to_chunks(seen_bodies[0], "POST", 1024).chunks)
+        second_chunks = tuple(body_to_chunks(seen_bodies[1], "POST", 1024).chunks)
+        assert first_chunks == expected_chunks
+        assert second_chunks == expected_chunks
+
+    def test_retry_with_unrewindable_body_raises_unrewindable_error(self) -> None:
+        """
+        Control case for the existing rewind contract: a file-like body that
+        records a position via ``tell()`` but cannot return to it (no
+        ``seek()``) must raise ``UnrewindableBodyError`` on retry, rather
+        than being silently resent as an empty body.
+        """
+
+        class TellableStream:
+            """A stream-like object with tell() and read() but no seek()."""
+
+            def __init__(self, data: bytes) -> None:
+                self._data = data
+                self._pos = 0
+
+            def read(self, n: int = -1) -> bytes:
+                if n == -1:
+                    chunk = self._data[self._pos :]
+                    self._pos = len(self._data)
+                else:
+                    chunk = self._data[self._pos : self._pos + n]
+                    self._pos += len(chunk)
+                return chunk
+
+            def tell(self) -> int:
+                return self._pos
+
+        body = TellableStream(b"hello world")
+        attempts = 0
+
+        def fail_every_time(
+            conn: HTTPConnection,
+            method: str,
+            url: str,
+            *args: typing.Any,
+            **kwargs: typing.Any,
+        ) -> typing.NoReturn:
+            nonlocal attempts
+            attempts += 1
+            raise OSError("connection reset")
+
+        with HTTPConnectionPool(host="localhost", maxsize=1) as pool:
+            with patch.object(pool, "_make_request", side_effect=fail_every_time):
+                with pytest.raises(
+                    UnrewindableBodyError, match="body does not implement seek"
+                ):
+                    pool.urlopen(
+                        "POST",
+                        "/",
+                        body=body,  # type: ignore[arg-type]
+                        retries=Retry(total=2, allowed_methods=["POST"]),
+                        chunked=True,
+                    )
+
+        # Same fail-fast guarantee as one-shot iterators: the unrewindable
+        # body is rejected on the first rewind, never resent empty.
+        assert attempts == 1
 
     def test_read_timeout_0_does_not_raise_bad_status_line_error(self) -> None:
         with HTTPConnectionPool(host="localhost", maxsize=1) as pool:
